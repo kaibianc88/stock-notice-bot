@@ -2,7 +2,7 @@
 """
 A股司法拍卖公告自动推送机器人
 功能：每日自动获取司法拍卖公告并推送到企业微信
-版本：v1.3 - 添加测试模式，优化重复推送检查
+版本：v1.4 - 修复手动触发被跳过的问题
 """
 
 import akshare as ak
@@ -22,7 +22,7 @@ class StockNoticeBot:
     def __init__(self):
         self.webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=dff99b4e-b4f4-44a5-87aa-9cb326de8777"
         self.beijing_tz = timezone(timedelta(hours=8))  # 北京时区 UTC+8
-        self.is_test_mode = os.getenv('GITHUB_ACTIONS') is None  # 本地运行时为测试模式
+        self.is_manual_trigger = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
         
     def get_beijing_time(self):
         """获取当前北京时间"""
@@ -40,18 +40,16 @@ class StockNoticeBot:
         返回: (should_send, reason)
         """
         current_time = self.get_beijing_time()
-        current_date = current_time.date()
         
-        # 测试模式：总是发送
-        if self.is_test_mode:
-            return True, "测试模式：允许发送"
+        # 手动触发：总是发送
+        if self.is_manual_trigger:
+            return True, "手动触发模式：允许发送"
         
-        # 生产环境：检查是否在同一天内已经发送过
-        # 这里使用简单的时间判断，实际部署中可以更复杂
-        if current_time.hour < 12:  # 只在中午前执行
-            return True, "生产环境：允许发送"
+        # 自动触发：检查是否在发送时段内（6:00-12:00）
+        if 6 <= current_time.hour < 12:
+            return True, "自动触发：在发送时段内"
         else:
-            return False, "生产环境：今日已过发送时段"
+            return False, f"自动触发：今日已过发送时段（当前时间: {current_time.hour}:{current_time.minute}）"
     
     def validate_config(self):
         """验证配置"""
@@ -174,8 +172,8 @@ class StockNoticeBot:
         base_message = f"# 🏛️ 司法拍卖公告提示 \n\n**📊 统计时间：{display_date_str} 06:00 - {end_time.strftime('%Y年%m月%d日')} 06:00**\n\n"
         current_time = self.format_beijing_time()
         
-        # 添加模式标识
-        mode_indicator = " (测试模式)" if self.is_test_mode else ""
+        # 添加触发模式标识
+        mode_indicator = " (手动触发)" if self.is_manual_trigger else " (自动触发)"
         
         if data_status == "success_with_data":
             message = base_message
@@ -214,14 +212,16 @@ class StockNoticeBot:
         try:
             print("=" * 60)
             print("🏁 开始执行A股司法拍卖公告查询...")
-            if self.is_test_mode:
-                print("🔬 当前运行在测试模式")
+            if self.is_manual_trigger:
+                print("🔄 当前为手动触发模式")
             else:
-                print("🚀 当前运行在生产模式")
+                print("⏰ 当前为自动触发模式")
             print("=" * 60)
             
             # 重复推送检查
             should_send, reason = self.should_send_message()
+            print(f"📋 发送检查: {reason}")
+            
             if not should_send:
                 print(f"⏸️ {reason}，脚本终止执行")
                 return True
