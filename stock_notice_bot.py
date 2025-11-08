@@ -2,8 +2,7 @@
 """
 A股司法拍卖公告自动推送机器人
 功能：每日自动获取司法拍卖公告并推送到企业微信
-作者：基于AKShare数据源
-版本：v1.1 - 修复时区问题
+版本：v1.3 - 添加测试模式，优化重复推送检查
 """
 
 import akshare as ak
@@ -14,6 +13,7 @@ import json
 import sys
 import traceback
 import time
+import os
 
 
 class StockNoticeBot:
@@ -22,6 +22,7 @@ class StockNoticeBot:
     def __init__(self):
         self.webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=dff99b4e-b4f4-44a5-87aa-9cb326de8777"
         self.beijing_tz = timezone(timedelta(hours=8))  # 北京时区 UTC+8
+        self.is_test_mode = os.getenv('GITHUB_ACTIONS') is None  # 本地运行时为测试模式
         
     def get_beijing_time(self):
         """获取当前北京时间"""
@@ -32,6 +33,25 @@ class StockNoticeBot:
         if dt is None:
             dt = self.get_beijing_time()
         return dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    def should_send_message(self):
+        """
+        检查是否应该发送消息
+        返回: (should_send, reason)
+        """
+        current_time = self.get_beijing_time()
+        current_date = current_time.date()
+        
+        # 测试模式：总是发送
+        if self.is_test_mode:
+            return True, "测试模式：允许发送"
+        
+        # 生产环境：检查是否在同一天内已经发送过
+        # 这里使用简单的时间判断，实际部署中可以更复杂
+        if current_time.hour < 12:  # 只在中午前执行
+            return True, "生产环境：允许发送"
+        else:
+            return False, "生产环境：今日已过发送时段"
     
     def validate_config(self):
         """验证配置"""
@@ -150,8 +170,12 @@ class StockNoticeBot:
     
     def create_message(self, display_date_str, end_time, data_status, filtered_notices=None, error_details=""):
         """创建推送消息"""
-        base_message = f"# 🏛️ 司法拍卖公告提示 \n\n**📊 统计时间：{display_date_str} 08:30 - {end_time.strftime('%Y年%m月%d日')} 08:30**\n\n"
+        # 修改时间范围显示为6:00
+        base_message = f"# 🏛️ 司法拍卖公告提示 \n\n**📊 统计时间：{display_date_str} 06:00 - {end_time.strftime('%Y年%m月%d日')} 06:00**\n\n"
         current_time = self.format_beijing_time()
+        
+        # 添加模式标识
+        mode_indicator = " (测试模式)" if self.is_test_mode else ""
         
         if data_status == "success_with_data":
             message = base_message
@@ -167,18 +191,18 @@ class StockNoticeBot:
                 
                 message += f"| {i} | {stock_code} | {stock_name} | {title} | {publish_date} |\n"
                 
-            message += f"\n**✅ 数据获取时间：{current_time} (北京时间)**"
+            message += f"\n**✅ 数据获取时间：{current_time} (北京时间){mode_indicator}**"
             
         elif data_status == "success_no_data":
             message = base_message
             message += f"**📭 昨日无司法拍卖提示信息**\n\n"
-            message += f"**✅ 数据获取时间：{current_time} (北京时间)**"
+            message += f"**✅ 数据获取时间：{current_time} (北京时间){mode_indicator}**"
             
         else:  # data_status == "failed"
             message = base_message
             message += f"**❌ 数据获取失败**\n\n**错误详情：{error_details}**\n\n"
             message += f"**💡 状态：已自动重试多次，明天将再次尝试**\n\n"
-            message += f"**✅ 最后尝试时间：{current_time} (北京时间)**"
+            message += f"**✅ 最后尝试时间：{current_time} (北京时间){mode_indicator}**"
         
         return message
     
@@ -190,7 +214,17 @@ class StockNoticeBot:
         try:
             print("=" * 60)
             print("🏁 开始执行A股司法拍卖公告查询...")
+            if self.is_test_mode:
+                print("🔬 当前运行在测试模式")
+            else:
+                print("🚀 当前运行在生产模式")
             print("=" * 60)
+            
+            # 重复推送检查
+            should_send, reason = self.should_send_message()
+            if not should_send:
+                print(f"⏸️ {reason}，脚本终止执行")
+                return True
             
             # 配置验证
             print("🔧 验证配置...")
@@ -202,9 +236,9 @@ class StockNoticeBot:
             
             print("✅ 配置验证通过")
             
-            # 计算时间范围（使用北京时间）
+            # 计算时间范围（使用北京时间，调整为6:00）
             now = self.get_beijing_time()
-            end_time = now.replace(hour=8, minute=30, second=0, microsecond=0)
+            end_time = now.replace(hour=6, minute=0, second=0, microsecond=0)  # 修改为6:00
             start_time = end_time - timedelta(days=1)
 
             display_date_str = start_time.strftime('%Y年%m月%d日')
