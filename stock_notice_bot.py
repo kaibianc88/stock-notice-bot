@@ -2,7 +2,7 @@
 """
 A股司法拍卖公告自动推送机器人
 功能：每日自动获取司法拍卖公告并推送到企业微信
-版本：v1.4 - 修复手动触发被跳过的问题
+版本：v1.5 - 优化部分失败处理逻辑
 """
 
 import akshare as ak
@@ -97,8 +97,8 @@ class StockNoticeBot:
         print("❌ 消息发送失败，已超过最大重试次数")
         return False
     
-    def get_notice_data(self, date_str, max_retries=3):
-        """获取公告数据"""
+    def get_notice_data(self, date_str, max_retries=2):
+        """获取公告数据 - 增加错误处理的健壮性"""
         for attempt in range(max_retries):
             try:
                 print(f"📡 第{attempt+1}次尝试获取 {date_str} 的公告...")
@@ -120,35 +120,42 @@ class StockNoticeBot:
                     
                 if day_df.empty:
                     print("ℹ️ 该日无公告数据")
-                    return day_df
+                    return day_df, True  # 返回空DataFrame但标记为成功
                 
-                # 检查必要列
+                # 检查必要列是否存在
                 required_columns = ['公告标题', '代码', '名称', '公告日期']
                 missing_columns = [col for col in required_columns if col not in day_df.columns]
                 if missing_columns:
                     print(f"⚠️ 数据缺少必要列: {missing_columns}")
+                    # 即使缺少某些列，只要主要数据存在，仍然继续处理
+                    if '公告标题' not in day_df.columns:
+                        print("❌ 缺少关键列'公告标题'，无法处理")
+                        continue
                 
                 print(f"📊 获取到 {len(day_df)} 条公告")
-                return day_df
+                return day_df, True
                 
             except Exception as e:
                 error_msg = str(e)
                 print(f"❌ 第{attempt+1}次获取失败: {error_msg}")
+                traceback.print_exc()  # 打印详细错误信息
                 
                 # 错误分类提示
                 if any(keyword in error_msg for keyword in ['Connection', 'proxy', 'timeout', 'SSL']):
                     print("🌐 网络连接问题")
+                elif "'代码'" in error_msg:
+                    print("🔧 数据格式异常：可能该日期数据尚未完全生成")
                 else:
                     print("❓ 未知错误")
             
             # 指数退避重试
             if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) * 5
+                wait_time = (2 ** attempt) * 3  # 减少等待时间
                 print(f"🔄 等待{wait_time}秒后重试... (剩余重试次数: {max_retries - attempt - 1})")
                 time.sleep(wait_time)
         
         print(f"❌ 获取 {date_str} 数据失败，已超过最大重试次数")
-        return None
+        return pd.DataFrame(), False  # 返回空DataFrame并标记为失败
     
     def filter_auction_notices(self, notices_df):
         """筛选司法拍卖公告"""
@@ -156,17 +163,21 @@ class StockNoticeBot:
             return pd.DataFrame()
             
         if '公告标题' not in notices_df.columns:
-            print("⚠️ 数据中缺少'公告标题'列")
+            print("⚠️ 数据中缺少'公告标题'列，无法筛选")
             return pd.DataFrame()
         
-        filtered = notices_df[
-            notices_df['公告标题'].str.contains('拍卖', na=False) & 
-            notices_df['公告标题'].str.contains('提示性', na=False)
-        ]
-        print(f"🎯 筛选出司法拍卖公告: {len(filtered)} 条")
-        return filtered
+        try:
+            filtered = notices_df[
+                notices_df['公告标题'].str.contains('拍卖', na=False) & 
+                notices_df['公告标题'].str.contains('提示性', na=False)
+            ]
+            print(f"🎯 筛选出司法拍卖公告: {len(filtered)} 条")
+            return filtered
+        except Exception as e:
+            print(f"❌ 筛选公告时发生错误: {e}")
+            return pd.DataFrame()
     
-    def create_message(self, display_date_str, end_time, data_status, filtered_notices=None, error_details=""):
+    def create_message(self, display_date_str, end_time, data_status, filtered_notices=None, error_details="", partial_success=False):
         """创建推送消息"""
         # 修改时间范围显示为6:00
         base_message = f"# 🏛️ 司法拍卖公告提示 \n\n**📊 统计时间：{display_date_str} 06:00 - {end_time.strftime('%Y年%m月%d日')} 06:00**\n\n"
@@ -182,7 +193,7 @@ class StockNoticeBot:
             message += "| :---: | :---: | :---: | :--- | :---: |\n"
             
             for i, (_, row) in enumerate(filtered_notices.iterrows(), 1):
-                stock_code = str(row.get('代码', '')).split('.')[0].zfill(6)
+                stock_code = str(row.get('代码', '')).split('.')[0].zfill(6) if pd.notna(row.get('代码')) else '未知'
                 stock_name = row.get('名称', '未知')
                 title = row.get('公告标题', '无标题')[:50]  # 限制标题长度
                 publish_date = row.get('公告日期', '未知日期')
@@ -194,6 +205,29 @@ class StockNoticeBot:
         elif data_status == "success_no_data":
             message = base_message
             message += f"**📭 昨日无司法拍卖提示信息**\n\n"
+            message += f"**✅ 数据获取时间：{current_time} (北京时间){mode_indicator}**"
+            
+        elif data_status == "partial_success":
+            message = base_message
+            if partial_success:
+                message += f"**⚠️ 部分数据获取成功**\n\n"
+                message += f"**📋 从可用数据中筛选出司法拍卖提示信息 {len(filtered_notices)} 个**\n\n"
+                message += "| 序号 | 股票代码 | 股票简称 | 公告标题 | 发布日期 |\n"
+                message += "| :---: | :---: | :---: | :--- | :---: |\n"
+                
+                for i, (_, row) in enumerate(filtered_notices.iterrows(), 1):
+                    stock_code = str(row.get('代码', '')).split('.')[0].zfill(6) if pd.notna(row.get('代码')) else '未知'
+                    stock_name = row.get('名称', '未知')
+                    title = row.get('公告标题', '无标题')[:50]
+                    publish_date = row.get('公告日期', '未知日期')
+                    
+                    message += f"| {i} | {stock_code} | {stock_name} | {title} | {publish_date} |\n"
+                    
+                message += f"\n**💡 注：部分日期数据获取异常，已使用可用数据**\n\n"
+            else:
+                message += f"**⚠️ 部分数据获取成功但无拍卖信息**\n\n"
+                message += f"**💡 从可用数据中未发现司法拍卖公告**\n\n"
+            
             message += f"**✅ 数据获取时间：{current_time} (北京时间){mode_indicator}**"
             
         else:  # data_status == "failed"
@@ -250,8 +284,9 @@ class StockNoticeBot:
             print("\n📡 开始获取公告数据...")
             
             df_list = []
-            data_fetch_success = True
+            all_dates_success = True
             fetch_errors = []
+            partial_success = False
             
             dates_to_fetch = [
                 start_time.strftime('%Y%m%d'),
@@ -264,21 +299,27 @@ class StockNoticeBot:
                     print("⏰ 脚本运行时间过长，提前结束")
                     break
                     
-                day_df = self.get_notice_data(date_str)
+                day_df, success = self.get_notice_data(date_str)
                 
-                if day_df is None:
-                    data_fetch_success = False
+                if not success:
+                    all_dates_success = False
                     fetch_errors.append(f"日期 {date_str} 获取失败")
+                    print(f"❌ 日期 {date_str} 获取失败，但继续处理其他日期")
                 elif not day_df.empty:
                     df_list.append(day_df)
                     print(f"✅ 日期 {date_str} 处理完成")
                 else:
                     print(f"ℹ️ 日期 {date_str} 无数据")
             
+            # 如果有部分日期成功，标记为部分成功
+            if not all_dates_success and df_list:
+                partial_success = True
+                print("⚠️ 部分日期数据获取失败，但将继续处理成功获取的数据")
+            
             # 数据处理和筛选
             filtered_notices = pd.DataFrame()
             
-            if data_fetch_success and df_list:
+            if df_list:  # 只要有数据就继续处理
                 try:
                     all_notices_df = pd.concat(df_list, ignore_index=True)
                     print(f"📊 合并后总公告数: {len(all_notices_df)} 条")
@@ -286,18 +327,30 @@ class StockNoticeBot:
                     
                 except Exception as e:
                     print(f"❌ 数据处理异常: {e}")
-                    data_fetch_success = False
+                    all_dates_success = False
                     fetch_errors.append(f"数据处理失败: {str(e)}")
             
             # 准备发送的消息
             print("\n📝 准备发送消息...")
             
-            if not data_fetch_success:
+            webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=dff99b4e-b4f4-44a5-87aa-9cb326de8777"
+            final_message = ""
+            
+            if not df_list and not all_dates_success:
+                # 完全失败：没有任何数据
                 error_details = "; ".join(fetch_errors)
                 final_message = self.create_message(display_date_str, end_time, "failed", error_details=error_details)
+            elif partial_success and filtered_notices.empty:
+                # 部分成功但没有拍卖信息
+                final_message = self.create_message(display_date_str, end_time, "partial_success", partial_success=False)
+            elif partial_success and not filtered_notices.empty:
+                # 部分成功且有拍卖信息
+                final_message = self.create_message(display_date_str, end_time, "partial_success", filtered_notices, partial_success=True)
             elif not filtered_notices.empty:
+                # 完全成功且有数据
                 final_message = self.create_message(display_date_str, end_time, "success_with_data", filtered_notices)
             else:
+                # 完全成功但无数据
                 final_message = self.create_message(display_date_str, end_time, "success_no_data")
 
             print("=" * 60)
